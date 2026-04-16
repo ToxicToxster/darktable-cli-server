@@ -38,3 +38,18 @@ async def write_upload(upload: UploadFile, dest: Path) -> int:
             f.write(chunk)
             total += len(chunk)
     return total
+
+
+async def write_body_to_file(receive, dest: Path, max_bytes: int) -> int:
+    """Stream raw request body to *dest*. Returns bytes written.
+
+    Raises *ValueError* if the body exceeds *max_bytes*.
+    """
+    total = 0
+    with dest.open("wb") as f:
+        async for chunk in receive:
+            f.write(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Body exceeds maximum size of {max_bytes} bytes")
+    return total

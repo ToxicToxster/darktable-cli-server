@@ -231,19 +231,39 @@ class TestRenderValidation:
 
 
 class TestPreviewValidation:
-    def test_rejects_unsupported_extension(self, client: TestClient) -> None:
-        r = client.post("/preview", files={"file": ("test.gif", b"data", "image/gif")})
-        assert r.status_code == 415
-
-    def test_ignores_extra_form_fields(self, client: TestClient) -> None:
-        """Extra form data must be silently ignored — /preview is parameter-free."""
+    def test_rejects_missing_x_filename(self, client: TestClient) -> None:
         r = client.post(
             "/preview",
-            files={"file": ("test.gif", b"data", "image/gif")},
-            data={"quality": "50", "width": "800"},
+            content=b"raw-data",
+            headers={"Content-Type": "application/octet-stream"},
         )
-        # still rejected for bad extension, not for extra fields
+        assert r.status_code == 400
+        assert "X-Filename" in r.json()["error"]
+
+    def test_rejects_empty_x_filename(self, client: TestClient) -> None:
+        r = client.post(
+            "/preview",
+            content=b"raw-data",
+            headers={"Content-Type": "application/octet-stream", "X-Filename": "  "},
+        )
+        assert r.status_code == 400
+
+    def test_rejects_unsupported_extension(self, client: TestClient) -> None:
+        r = client.post(
+            "/preview",
+            content=b"raw-data",
+            headers={"Content-Type": "application/octet-stream", "X-Filename": "test.gif"},
+        )
         assert r.status_code == 415
+
+    def test_rejects_empty_body(self, client: TestClient) -> None:
+        r = client.post(
+            "/preview",
+            content=b"",
+            headers={"Content-Type": "application/octet-stream", "X-Filename": "test.dng"},
+        )
+        assert r.status_code == 400
+        assert "Empty" in r.json()["error"]
 
 
 class TestRenderSuccess:
@@ -272,9 +292,14 @@ class TestRenderSuccess:
              patch("app.services.darktable.get_darktable_cli_path", return_value="/usr/bin/darktable-cli"):
             r = client.post(
                 "/preview",
-                files={"file": ("IMG_001.arw", b"raw-data", "application/octet-stream")},
+                content=b"raw-data",
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Filename": "IMG_001.arw",
+                },
             )
         assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/jpeg")
         assert "IMG_001.jpg" in r.headers.get("content-disposition", "")
 
 

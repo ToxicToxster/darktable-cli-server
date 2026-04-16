@@ -4,8 +4,8 @@ A production-grade local HTTP service that wraps `darktable-cli` for rendering R
 
 ## What it does
 
-- **`POST /render`** &mdash; General-purpose rendering: upload a RAW file, get a rendered image back with full parameter control.
-- **`POST /preview`** &mdash; Quick preview: upload a RAW file, get a preview image using server-side defaults (no parameters needed).
+- **`POST /render`** &mdash; Flexible general-purpose rendering: multipart form upload with full parameter control (format, size, quality, darktable options).
+- **`POST /preview`** &mdash; Fixed preset preview for integrations (e.g. Nextcloud): raw binary body, no parameters, all settings from server config.
 - **`GET /health`** &mdash; Health check.
 - **`GET /version`** &mdash; Version info including darktable availability.
 
@@ -74,15 +74,27 @@ Error responses are JSON:
 
 ### `POST /preview`
 
-Fixed server-side preset endpoint for integrations (e.g. Nextcloud). Accepts **only** the uploaded file — all rendering settings come exclusively from application configuration (env vars, `.env`, Docker Compose). No per-request parameters are accepted.
+Fixed server-side preset endpoint optimised for server-to-server integration (e.g. Nextcloud). The RAW file is sent as the **raw HTTP request body** (not multipart form-data). All rendering settings come exclusively from application configuration.
+
+| Header | Required | Description |
+|---|---|---|
+| `Content-Type` | yes | Must be `application/octet-stream` |
+| `X-Filename` | yes | Original filename (e.g. `IMG_001.dng`). Used to determine source format and to set the output filename. |
+| `X-API-Key` | if configured | API key (same as `/render`) |
+
+**Request body:** raw binary file content (the RAW/DNG file).
+
+**Response:** rendered preview image as binary body with appropriate `Content-Type` (e.g. `image/jpeg`) and `Content-Disposition: inline; filename="<basename>.<preview ext>"`.
+
+Error responses are JSON (same codes as `/render`).
 
 ```bash
 curl -X POST http://localhost:8000/preview \
-  -F "file=@photo.dng" \
-  -OJ
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: IMG20251231222841.dng" \
+  --data-binary "@/path/to/IMG20251231222841.dng" \
+  -o IMG20251231222841.jpg
 ```
-
-The output filename preserves the original upload basename with the configured preview format extension (e.g. `photo.dng` → `photo.jpg`).
 
 ## Configuration
 
@@ -160,7 +172,9 @@ curl -X POST http://localhost:8000/render \
 
 ```bash
 curl -X POST http://localhost:8000/preview \
-  -F "file=@/path/to/IMG_001.dng" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: IMG_001.dng" \
+  --data-binary "@/path/to/IMG_001.dng" \
   -o IMG_001_preview.jpg
 ```
 

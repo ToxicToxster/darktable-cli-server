@@ -20,6 +20,7 @@ from app.security import (
     APIKeyMiddleware,
     MaxUploadSizeMiddleware,
     derive_output_filename,
+    sanitize_filename,
     validate_bool,
     validate_dt_arg,
     validate_dt_conf,
@@ -27,7 +28,7 @@ from app.security import (
     validate_output_format,
 )
 from app.services.darktable import FORMAT_EXTENSION_MAP, RenderParams, get_darktable_cli_path, run_render
-from app.services.files import cleanup_temp_dir, create_temp_dir, write_upload
+from app.services.files import cleanup_temp_dir, create_temp_dir, write_body_to_file, write_upload
 
 logger = logging.getLogger("darktable_server")
 
@@ -112,24 +113,110 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @application.post(
         "/preview",
         response_model=None,
+        summary="Fixed preset preview (raw binary body)",
+        description=(
+            "Server-to-server preview endpoint optimised for integrations like Nextcloud. "
+            "Send the RAW file as the raw HTTP request body with "
+            "`Content-Type: application/octet-stream` and an `X-Filename` header "
+            "containing the original filename. All rendering settings are taken from "
+            "server configuration only."
+        ),
         responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse},
                    415: {"model": ErrorResponse}, 500: {"model": ErrorResponse},
                    504: {"model": ErrorResponse}},
     )
-    async def preview(
-        file: UploadFile = File(...),
-    ) -> FileResponse | JSONResponse:
-        return await _do_render(
-            file=file,
-            output_format=settings.preview_format,
-            width=str(settings.preview_width),
-            height=str(settings.preview_height),
-            quality=str(settings.preview_quality),
-            hq=str(settings.preview_hq).lower(),
-            upscale=str(settings.preview_upscale).lower(),
-            apply_custom_presets=str(settings.preview_apply_custom_presets).lower(),
-            dt_args=[], dt_confs=[], settings=settings, endpoint="preview",
-        )
+    async def preview(request: Request) -> FileResponse | JSONResponse:
+        # --- validate X-Filename header ---
+        raw_filename = request.headers.get("x-filename")
+        if not raw_filename or not raw_filename.strip():
+            return _error(400, "Missing or empty X-Filename header")
+
+        filename = sanitize_filename(raw_filename)
+        ext = Path(filename).suffix.lower()
+        allowed_exts = settings.allowed_raw_extensions_set()
+        if ext not in allowed_exts:
+            return _error(415, "Unsupported file type", {
+                "extension": ext, "allowed": sorted(allowed_exts),
+            })
+
+        # --- stream body to temp file ---
+        temp_dir = create_temp_dir(settings.temp_dir)
+        cleanup_needed = True
+
+        try:
+            fmt = settings.preview_format
+            out_ext = FORMAT_EXTENSION_MAP.get(fmt, f".{fmt}")
+            input_path = temp_dir / f"input{ext}"
+            output_path = temp_dir / f"output{out_ext}"
+
+            try:
+                size = await write_body_to_file(
+                    request.stream(), input_path, settings.max_upload_bytes,
+                )
+            except ValueError:
+                return _error(413, "Upload exceeds maximum size")
+
+            if size == 0:
+                return _error(400, "Empty request body")
+
+            # --- render using config-only preview settings ---
+            params = RenderParams(
+                width=settings.preview_width if settings.preview_width > 0 else None,
+                height=settings.preview_height if settings.preview_height > 0 else None,
+                hq=settings.preview_hq,
+                upscale=settings.preview_upscale,
+                apply_custom_presets=settings.preview_apply_custom_presets,
+                output_format=fmt,
+                quality=settings.preview_quality,
+            )
+
+            sem = get_semaphore()
+            try:
+                async with asyncio.timeout(settings.request_timeout + 5):
+                    await sem.acquire()
+            except TimeoutError:
+                return _error(504, "Server too busy, render queue full")
+
+            try:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, run_render, input_path, output_path, params,
+                    settings.request_timeout,
+                )
+            finally:
+                sem.release()
+
+            if not result.success:
+                if result.error and "timed out" in result.error.lower():
+                    return _error(504, "Render timeout", {"seconds": settings.request_timeout})
+                return _error(500, "Render failed", {
+                    "message": result.error,
+                    "returncode": result.returncode,
+                    "stderr": (result.stderr or "")[:1000],
+                })
+
+            response_filename = derive_output_filename(filename, out_ext.lstrip("."))
+            media = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{out_ext.lstrip('.')}"
+            if fmt in ("tif", "tiff"):
+                media = "image/tiff"
+            if fmt == "png":
+                media = "image/png"
+
+            logger.info(
+                "endpoint=preview format=%s filename=%s duration=%.1fs",
+                fmt, response_filename, result.duration_seconds,
+            )
+
+            cleanup_needed = False
+            return FileResponse(
+                path=result.output_path,
+                media_type=media,
+                headers={"Content-Disposition": f'inline; filename="{response_filename}"'},
+                background=BackgroundTask(cleanup_temp_dir, temp_dir),
+            )
+        finally:
+            if cleanup_needed:
+                cleanup_temp_dir(temp_dir)
 
     return application
 
