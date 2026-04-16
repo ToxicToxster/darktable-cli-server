@@ -117,32 +117,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                    504: {"model": ErrorResponse}},
     )
     async def preview(
-        request: Request,
         file: UploadFile = File(...),
-        output_format: Optional[str] = Form(None),
-        width: Optional[str] = Form(None),
-        height: Optional[str] = Form(None),
-        quality: Optional[str] = Form(None),
-        hq: Optional[str] = Form(None),
-        upscale: Optional[str] = Form(None),
-        apply_custom_presets: Optional[str] = Form(None),
     ) -> FileResponse | JSONResponse:
-        if not settings.preview_allow_overrides:
-            output_format = None
-            width = height = quality = hq = upscale = apply_custom_presets = None
-
         return await _do_render(
             file=file,
-            output_format=output_format or settings.preview_format,
-            width=width if width is not None else str(settings.preview_width),
-            height=height if height is not None else str(settings.preview_height),
-            quality=quality if quality is not None else str(settings.preview_quality),
-            hq=hq if hq is not None else str(settings.preview_hq).lower(),
-            upscale=upscale if upscale is not None else str(settings.preview_upscale).lower(),
-            apply_custom_presets=(
-                apply_custom_presets if apply_custom_presets is not None
-                else str(settings.preview_apply_custom_presets).lower()
-            ),
+            output_format=settings.preview_format,
+            width=str(settings.preview_width),
+            height=str(settings.preview_height),
+            quality=str(settings.preview_quality),
+            hq=str(settings.preview_hq).lower(),
+            upscale=str(settings.preview_upscale).lower(),
+            apply_custom_presets=str(settings.preview_apply_custom_presets).lower(),
             dt_args=[], dt_confs=[], settings=settings, endpoint="preview",
         )
 

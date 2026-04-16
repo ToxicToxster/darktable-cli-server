@@ -74,9 +74,15 @@ Error responses are JSON:
 
 ### `POST /preview`
 
-Same as `/render` but uses server-side defaults. No parameters required (just upload the file).
+Fixed server-side preset endpoint for integrations (e.g. Nextcloud). Accepts **only** the uploaded file — all rendering settings come exclusively from application configuration (env vars, `.env`, Docker Compose). No per-request parameters are accepted.
 
-If `PREVIEW_ALLOW_OVERRIDES=true`, per-request overrides are accepted for the same fields as `/render` (except `dt_arg`/`dt_conf`).
+```bash
+curl -X POST http://localhost:8000/preview \
+  -F "file=@photo.dng" \
+  -OJ
+```
+
+The output filename preserves the original upload basename with the configured preview format extension (e.g. `photo.dng` → `photo.jpg`).
 
 ## Configuration
 
@@ -99,7 +105,6 @@ All settings can be configured via CLI args, environment variables, `.env` file,
 | `PREVIEW_HQ` | `false` | Preview high quality |
 | `PREVIEW_UPSCALE` | `false` | Preview upscaling |
 | `PREVIEW_APPLY_CUSTOM_PRESETS` | `false` | Preview custom presets |
-| `PREVIEW_ALLOW_OVERRIDES` | `false` | Allow per-request preview overrides |
 | `ALLOWED_OUTPUT_FORMATS` | `jpg,jpeg,png,tif,tiff` | Allowed output formats |
 | `ALLOWED_RAW_EXTENSIONS` | `.dng,.arw,.nef,...` | Allowed input extensions |
 | `DT_ARG_DENYLIST` | *(empty)* | Comma-separated denied dt_arg tokens |

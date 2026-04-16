@@ -235,6 +235,16 @@ class TestPreviewValidation:
         r = client.post("/preview", files={"file": ("test.gif", b"data", "image/gif")})
         assert r.status_code == 415
 
+    def test_ignores_extra_form_fields(self, client: TestClient) -> None:
+        """Extra form data must be silently ignored — /preview is parameter-free."""
+        r = client.post(
+            "/preview",
+            files={"file": ("test.gif", b"data", "image/gif")},
+            data={"quality": "50", "width": "800"},
+        )
+        # still rejected for bad extension, not for extra fields
+        assert r.status_code == 415
+
 
 class TestRenderSuccess:
     def test_render_returns_jpeg(self, client: TestClient) -> None:

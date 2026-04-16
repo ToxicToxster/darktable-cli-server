@@ -48,7 +48,6 @@ class Settings(BaseSettings):
     preview_hq: bool = False
     preview_upscale: bool = False
     preview_apply_custom_presets: bool = False
-    preview_allow_overrides: bool = False
 
     # --- format allow-lists ---
     allowed_output_formats: str = "jpg,jpeg,png,tif,tiff"

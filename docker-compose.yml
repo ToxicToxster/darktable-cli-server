@@ -18,5 +18,4 @@ services:
       - PREVIEW_HQ=false
       - PREVIEW_UPSCALE=false
       - PREVIEW_APPLY_CUSTOM_PRESETS=false
-      - PREVIEW_ALLOW_OVERRIDES=false
       # - API_KEY=your-secret-key
