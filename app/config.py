@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import shutil
 import subprocess
 from functools import lru_cache
@@ -40,6 +41,9 @@ class Settings(BaseSettings):
     # --- auth ---
     api_key: Optional[str] = None
 
+    # --- security level ---
+    security_level: int = 2
+
     # --- preview defaults ---
     preview_format: str = "jpg"
     preview_quality: int = 80
@@ -53,8 +57,18 @@ class Settings(BaseSettings):
     allowed_output_formats: str = "jpg,jpeg,png,tif,tiff"
     allowed_raw_extensions: str = ".dng,.arw,.nef,.cr2,.cr3,.orf,.rw2,.raf,.pef,.srw"
 
-    # --- advanced arg safety ---
-    dt_arg_denylist: str = ""
+    # --- access security ---
+    access_security_enabled: bool = False
+    access_require_api_key: bool = False
+    access_localhost_only: bool = False
+    access_enable_ip_allowlist: bool = False
+    access_ip_allowlist: str = ""
+    access_enable_cors_restriction: bool = False
+    access_cors_allowed_origins: str = ""
+    access_enable_rate_limit: bool = False
+    access_rate_limit_rpm: int = 60
+
+    # --- validators ---
 
     @field_validator("log_level")
     @classmethod
@@ -64,7 +78,25 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid log_level: {v}")
         return v
 
-    # --- derived helpers (not stored, computed) ---
+    @field_validator("security_level")
+    @classmethod
+    def _validate_security_level(cls, v: int) -> int:
+        if v not in (1, 2, 3):
+            raise ValueError("SECURITY_LEVEL must be 1, 2, or 3")
+        return v
+
+    # --- permission helpers ---
+
+    def is_render_allowed(self) -> bool:
+        return self.security_level >= 2
+
+    def is_render_passthrough_allowed(self) -> bool:
+        return self.security_level == 3
+
+    def effective_access_security_enabled(self) -> bool:
+        return True if self.security_level == 3 else self.access_security_enabled
+
+    # --- derived helpers ---
 
     def allowed_output_formats_set(self) -> set[str]:
         return {f.strip().lower() for f in self.allowed_output_formats.split(",") if f.strip()}
@@ -79,8 +111,53 @@ class Settings(BaseSettings):
                 exts.add(e)
         return exts
 
-    def dt_arg_denylist_set(self) -> set[str]:
-        return {t.strip().lower() for t in self.dt_arg_denylist.split(",") if t.strip()}
+    def parsed_ip_allowlist(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.access_ip_allowlist.split(","):
+            entry = entry.strip()
+            if entry:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+        return networks
+
+    def parsed_cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.access_cors_allowed_origins.split(",") if o.strip()]
+
+    # --- startup validation ---
+
+    def validate_effective_config(self) -> None:
+        eff = self.effective_access_security_enabled()
+        if eff and self.access_require_api_key:
+            if not self.api_key:
+                raise ValueError(
+                    "ACCESS_REQUIRE_API_KEY is enabled but no API_KEY is configured"
+                )
+        if eff and self.access_enable_ip_allowlist:
+            raw = self.access_ip_allowlist.strip()
+            if not raw:
+                raise ValueError(
+                    "ACCESS_ENABLE_IP_ALLOWLIST is enabled but ACCESS_IP_ALLOWLIST is empty"
+                )
+            for entry in raw.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    ipaddress.ip_network(entry, strict=False)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"ACCESS_IP_ALLOWLIST contains invalid entry '{entry}': {exc}"
+                    ) from exc
+        if eff and self.access_enable_cors_restriction:
+            if not self.access_cors_allowed_origins.strip():
+                raise ValueError(
+                    "ACCESS_ENABLE_CORS_RESTRICTION is enabled but "
+                    "ACCESS_CORS_ALLOWED_ORIGINS is empty"
+                )
+        if eff and self.access_enable_rate_limit:
+            if self.access_rate_limit_rpm < 1:
+                raise ValueError(
+                    "ACCESS_RATE_LIMIT_RPM must be >= 1 when rate limiting is enabled"
+                )
 
 
 @lru_cache(maxsize=1)

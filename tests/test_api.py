@@ -44,6 +44,37 @@ def client(settings: Settings) -> TestClient:
     return TestClient(app)
 
 
+def _raw_render(
+    client: TestClient,
+    filename: str = "test.dng",
+    body: bytes = b"raw-data",
+    params: dict | None = None,
+    extra_headers: dict | None = None,
+) -> "TestClient":
+    """Helper: POST /render with raw body + X-Filename + query params."""
+    headers = {"Content-Type": "application/octet-stream", "X-Filename": filename}
+    if extra_headers:
+        headers.update(extra_headers)
+    url = "/render"
+    if params:
+        from urllib.parse import urlencode
+        url = f"/render?{urlencode(params, doseq=True)}"
+    return client.post(url, content=body, headers=headers)
+
+
+def _raw_preview(
+    client: TestClient,
+    filename: str = "test.dng",
+    body: bytes = b"raw-data",
+    extra_headers: dict | None = None,
+) -> "TestClient":
+    """Helper: POST /preview with raw body + X-Filename."""
+    headers = {"Content-Type": "application/octet-stream", "X-Filename": filename}
+    if extra_headers:
+        headers.update(extra_headers)
+    return client.post("/preview", content=body, headers=headers)
+
+
 # ---------------------------------------------------------------------------
 # Filename sanitization
 # ---------------------------------------------------------------------------
@@ -117,23 +148,19 @@ class TestValidateOutputFormat:
 
 class TestValidateDtArg:
     def test_valid_token(self) -> None:
-        assert validate_dt_arg("--verbose", set()) == "--verbose"
+        assert validate_dt_arg("--verbose") == "--verbose"
 
     def test_rejects_output(self) -> None:
         with pytest.raises(ValueError, match="reserved"):
-            validate_dt_arg("output", set())
+            validate_dt_arg("output")
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValueError, match="Empty"):
-            validate_dt_arg("", set())
+            validate_dt_arg("")
 
     def test_rejects_null_byte(self) -> None:
         with pytest.raises(ValueError, match="forbidden"):
-            validate_dt_arg("foo\x00bar", set())
-
-    def test_denylist(self) -> None:
-        with pytest.raises(ValueError, match="denied"):
-            validate_dt_arg("--banned", {"--banned"})
+            validate_dt_arg("foo\x00bar")
 
 
 class TestValidateDtConf:
@@ -189,7 +216,7 @@ class TestBuildCommand:
 
 
 # ---------------------------------------------------------------------------
-# API endpoint tests
+# API endpoint tests — health & version
 # ---------------------------------------------------------------------------
 
 class TestHealthEndpoint:
@@ -208,123 +235,244 @@ class TestVersionEndpoint:
         assert "python_version" in data
 
 
+# ---------------------------------------------------------------------------
+# /render validation (raw binary transport)
+# ---------------------------------------------------------------------------
+
 class TestRenderValidation:
+    def test_rejects_missing_x_filename(self, client: TestClient) -> None:
+        r = client.post("/render", content=b"raw-data",
+                        headers={"Content-Type": "application/octet-stream"})
+        assert r.status_code == 400
+        assert "X-Filename" in r.json()["detail"]
+
     def test_rejects_unsupported_extension(self, client: TestClient) -> None:
-        r = client.post("/render", files={"file": ("test.txt", b"data", "text/plain")})
+        r = _raw_render(client, filename="test.txt")
         assert r.status_code == 415
 
     def test_rejects_invalid_width(self, client: TestClient) -> None:
-        r = client.post(
-            "/render",
-            data={"width": "abc"},
-            files={"file": ("test.dng", b"data", "application/octet-stream")},
-        )
+        r = _raw_render(client, params={"width": "abc"})
         assert r.status_code == 400
 
     def test_rejects_invalid_format(self, client: TestClient) -> None:
-        r = client.post(
-            "/render",
-            data={"output_format": "bmp"},
-            files={"file": ("test.dng", b"data", "application/octet-stream")},
-        )
+        r = _raw_render(client, params={"output_format": "bmp"})
         assert r.status_code == 400
 
+    def test_rejects_empty_body(self, client: TestClient) -> None:
+        r = _raw_render(client, body=b"")
+        assert r.status_code == 400
+
+    def test_rejects_invalid_quality(self, client: TestClient) -> None:
+        r = _raw_render(client, params={"quality": "200"})
+        assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /preview validation (raw binary transport)
+# ---------------------------------------------------------------------------
 
 class TestPreviewValidation:
     def test_rejects_missing_x_filename(self, client: TestClient) -> None:
-        r = client.post(
-            "/preview",
-            content=b"raw-data",
-            headers={"Content-Type": "application/octet-stream"},
-        )
+        r = client.post("/preview", content=b"raw-data",
+                        headers={"Content-Type": "application/octet-stream"})
         assert r.status_code == 400
-        assert "X-Filename" in r.json()["error"]
+        assert "X-Filename" in r.json()["detail"]
 
     def test_rejects_empty_x_filename(self, client: TestClient) -> None:
-        r = client.post(
-            "/preview",
-            content=b"raw-data",
-            headers={"Content-Type": "application/octet-stream", "X-Filename": "  "},
-        )
+        r = _raw_preview(client, filename="  ")
         assert r.status_code == 400
 
     def test_rejects_unsupported_extension(self, client: TestClient) -> None:
-        r = client.post(
-            "/preview",
-            content=b"raw-data",
-            headers={"Content-Type": "application/octet-stream", "X-Filename": "test.gif"},
-        )
+        r = _raw_preview(client, filename="test.gif")
         assert r.status_code == 415
 
     def test_rejects_empty_body(self, client: TestClient) -> None:
-        r = client.post(
-            "/preview",
-            content=b"",
-            headers={"Content-Type": "application/octet-stream", "X-Filename": "test.dng"},
-        )
+        r = _raw_preview(client, body=b"")
         assert r.status_code == 400
-        assert "Empty" in r.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Successful renders (mocked darktable-cli)
+# ---------------------------------------------------------------------------
+
+def _fake_run(cmd, stdout, stderr, text, timeout, check):
+    Path(cmd[2]).write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    return CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+
+_DTCLI_PATCH = patch("app.services.darktable.subprocess.run", _fake_run)
+_DTPATH_PATCH = patch(
+    "app.services.darktable.get_darktable_cli_path",
+    return_value="/usr/bin/darktable-cli",
+)
 
 
 class TestRenderSuccess:
     def test_render_returns_jpeg(self, client: TestClient) -> None:
-        def fake_run(cmd, stdout, stderr, text, timeout, check):
-            Path(cmd[2]).write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
-            return CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
-
-        with patch("app.services.darktable.subprocess.run", fake_run), \
-             patch("app.services.darktable.get_darktable_cli_path", return_value="/usr/bin/darktable-cli"):
-            r = client.post(
-                "/render",
-                files={"file": ("IMG_001.dng", b"raw-data", "application/octet-stream")},
-                data={"quality": "90"},
-            )
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(client, filename="IMG_001.dng", params={"quality": "90"})
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/jpeg")
         assert "IMG_001.jpg" in r.headers.get("content-disposition", "")
 
+    def test_render_png(self, client: TestClient) -> None:
+        def fake_png(cmd, stdout, stderr, text, timeout, check):
+            Path(cmd[2]).write_bytes(b"\x89PNGfake")
+            return CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+        with patch("app.services.darktable.subprocess.run", fake_png), _DTPATH_PATCH:
+            r = _raw_render(client, filename="test.cr2", params={"output_format": "png"})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/png")
+
+
+class TestPreviewSuccess:
     def test_preview_returns_jpeg(self, client: TestClient) -> None:
-        def fake_run(cmd, stdout, stderr, text, timeout, check):
-            Path(cmd[2]).write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
-            return CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
-
-        with patch("app.services.darktable.subprocess.run", fake_run), \
-             patch("app.services.darktable.get_darktable_cli_path", return_value="/usr/bin/darktable-cli"):
-            r = client.post(
-                "/preview",
-                content=b"raw-data",
-                headers={
-                    "Content-Type": "application/octet-stream",
-                    "X-Filename": "IMG_001.arw",
-                },
-            )
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_preview(client, filename="IMG_001.arw")
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("image/jpeg")
         assert "IMG_001.jpg" in r.headers.get("content-disposition", "")
 
 
-class TestAPIKeyAuth:
-    def test_rejected_without_key(self) -> None:
-        s = Settings(api_key="secret123", temp_dir="/tmp/dt-test-auth")
-        a = create_app(s)
-        c = TestClient(a)
-        r = c.post("/render", files={"file": ("test.dng", b"data", "application/octet-stream")})
+# ---------------------------------------------------------------------------
+# Security levels
+# ---------------------------------------------------------------------------
+
+class TestSecurityLevels:
+    """Test SECURITY_LEVEL gating on /render."""
+
+    def test_level1_blocks_render(self) -> None:
+        s = Settings(security_level=1, temp_dir="/tmp/dt-sec1")
+        c = TestClient(create_app(s))
+        r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 403
+        assert "disabled" in r.json()["detail"].lower()
+
+    def test_level1_allows_preview(self) -> None:
+        s = Settings(security_level=1, temp_dir="/tmp/dt-sec1")
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_preview(c, filename="test.dng")
+        assert r.status_code == 200
+
+    def test_level2_allows_render(self) -> None:
+        s = Settings(security_level=2, temp_dir="/tmp/dt-sec2")
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 200
+
+    def test_level2_blocks_dt_arg(self) -> None:
+        s = Settings(security_level=2, temp_dir="/tmp/dt-sec2")
+        c = TestClient(create_app(s))
+        r = _raw_render(c, filename="test.dng", params={"dt_arg": "--verbose"})
+        assert r.status_code == 403
+        assert "passthrough" in r.json()["detail"].lower()
+
+    def test_level2_blocks_dt_conf(self) -> None:
+        s = Settings(security_level=2, temp_dir="/tmp/dt-sec2")
+        c = TestClient(create_app(s))
+        r = _raw_render(c, filename="test.dng", params={"dt_conf": "key=val"})
+        assert r.status_code == 403
+
+    def test_level3_allows_dt_arg(self) -> None:
+        s = Settings(
+            security_level=3, temp_dir="/tmp/dt-sec3",
+            access_security_enabled=True, access_require_api_key=False,
+        )
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng", params={"dt_arg": "--verbose"})
+        assert r.status_code == 200
+
+    def test_level3_allows_dt_conf(self) -> None:
+        s = Settings(
+            security_level=3, temp_dir="/tmp/dt-sec3",
+            access_security_enabled=True, access_require_api_key=False,
+        )
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng", params={"dt_conf": "key=val"})
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
+
+class TestStartupValidation:
+    def test_level3_requires_access_security(self) -> None:
+        """Level 3 forces effective_access_security = True, which is fine (no crash)."""
+        s = Settings(
+            security_level=3, temp_dir="/tmp/dt-val",
+            access_security_enabled=True, access_require_api_key=False,
+        )
+        # Should not raise
+        s.validate_effective_config()
+
+    def test_api_key_required_but_missing_raises(self) -> None:
+        s = Settings(
+            security_level=2, temp_dir="/tmp/dt-val",
+            access_security_enabled=True,
+            access_require_api_key=True,
+            api_key=None,
+        )
+        with pytest.raises(ValueError, match="API_KEY"):
+            s.validate_effective_config()
+
+    def test_ip_allowlist_enabled_but_empty_raises(self) -> None:
+        s = Settings(
+            security_level=2, temp_dir="/tmp/dt-val",
+            access_security_enabled=True,
+            access_enable_ip_allowlist=True,
+            access_ip_allowlist="",
+        )
+        with pytest.raises(ValueError, match="(?i)allowlist"):
+            s.validate_effective_config()
+
+
+# ---------------------------------------------------------------------------
+# Access-security features
+# ---------------------------------------------------------------------------
+
+class TestAccessSecurity:
+    def test_api_key_rejected_without_key(self) -> None:
+        s = Settings(
+            api_key="secret123", temp_dir="/tmp/dt-acc",
+            access_security_enabled=True, access_require_api_key=True,
+        )
+        c = TestClient(create_app(s))
+        r = _raw_render(c, filename="test.dng")
         assert r.status_code == 401
 
-    def test_accepted_with_key(self) -> None:
-        s = Settings(api_key="secret123", temp_dir="/tmp/dt-test-auth")
-        a = create_app(s)
-        c = TestClient(a)
-        r = c.post(
-            "/render",
-            files={"file": ("test.dng", b"data", "application/octet-stream")},
-            headers={"X-API-Key": "secret123"},
+    def test_api_key_accepted_with_key(self) -> None:
+        s = Settings(
+            api_key="secret123", temp_dir="/tmp/dt-acc",
+            access_security_enabled=True, access_require_api_key=True,
         )
-        assert r.status_code != 401
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng", extra_headers={"X-API-Key": "secret123"})
+        assert r.status_code == 200
 
-    def test_health_no_auth(self) -> None:
-        s = Settings(api_key="secret123", temp_dir="/tmp/dt-test-auth")
-        a = create_app(s)
-        c = TestClient(a)
+    def test_health_no_auth_required(self) -> None:
+        s = Settings(
+            api_key="secret123", temp_dir="/tmp/dt-acc",
+            access_security_enabled=True, access_require_api_key=True,
+        )
+        c = TestClient(create_app(s))
         r = c.get("/health")
         assert r.status_code == 200
+
+    def test_api_key_inactive_without_access_security(self) -> None:
+        """API key set but access_security_enabled=False → no middleware → allowed."""
+        s = Settings(
+            api_key="secret123", temp_dir="/tmp/dt-acc",
+            access_security_enabled=False, access_require_api_key=True,
+        )
+        c = TestClient(create_app(s))
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng")
+        # Should NOT be 401 because access security is off
+        assert r.status_code != 401

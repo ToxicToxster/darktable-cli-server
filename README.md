@@ -4,30 +4,55 @@ A production-grade local HTTP service that wraps `darktable-cli` for rendering R
 
 ## What it does
 
-- **`POST /render`** &mdash; Flexible general-purpose rendering: multipart form upload with full parameter control (format, size, quality, darktable options).
-- **`POST /preview`** &mdash; Fixed preset preview for integrations (e.g. Nextcloud): raw binary body, no parameters, all settings from server config.
-- **`GET /health`** &mdash; Health check.
-- **`GET /version`** &mdash; Version info including darktable availability.
+- **`POST /render`** — Flexible rendering: raw binary body + query parameters. Capabilities depend on `SECURITY_LEVEL`.
+- **`POST /preview`** — Fixed preset preview for integrations (e.g. Nextcloud): raw binary body, no parameters, all settings from server config.
+- **`GET /health`** — Health check.
+- **`GET /version`** — Version info including darktable availability.
 
-The response filename always preserves the original upload basename with the correct output extension.
-Example: upload `IMG20251231222841.dng` &rarr; receive `IMG20251231222841.jpg`.
+Both `/render` and `/preview` use **identical transport**: raw HTTP body + `X-Filename` header → binary image response. The only difference is the control surface: `/preview` uses fixed server presets, `/render` accepts user-specified query parameters (gated by `SECURITY_LEVEL`).
+
+The response filename preserves the original upload basename with the correct output extension.
+Example: upload `IMG20251231222841.dng` → receive `IMG20251231222841.jpg`.
 
 ## Security model
 
-This service is designed for local/trusted-network use with defense-in-depth:
+### Security levels
 
-1. **No shell injection** &mdash; Commands are always built as Python lists, never concatenated strings. `shell=True` is never used.
-2. **No path traversal** &mdash; Uploaded filenames are never used as filesystem paths. Internal temp filenames are generated; the original basename is only used for `Content-Disposition`.
-3. **Safe temp files** &mdash; A dedicated temp directory is used. Cleanup runs via `BackgroundTask` after response delivery, or immediately on error.
-4. **Input validation** &mdash; Upload size limits, integer range checks, format allowlists, extension allowlists.
-5. **Bounded concurrency** &mdash; `asyncio.Semaphore` limits parallel renders. Requests exceeding the limit get 504.
-6. **Timeout protection** &mdash; `darktable-cli` is killed after `REQUEST_TIMEOUT` seconds.
-7. **Optional API key** &mdash; Set `API_KEY` to require `X-API-Key` header on `/render` and `/preview`.
-8. **Container hardening** &mdash; Runs as non-root user `dtuser` inside Docker.
+| Level | `/preview` | `/render` | `dt_arg`/`dt_conf` | Access security |
+|-------|-----------|-----------|---------------------|-----------------|
+| **1** | ✓ | ✗ (403) | ✗ | Optional |
+| **2** (default) | ✓ | ✓ (safe params only) | ✗ (403) | Optional |
+| **3** | ✓ | ✓ (all params) | ✓ (validated) | **Forced on** |
 
-### Why arbitrary shell strings are not supported
+Set via `SECURITY_LEVEL` environment variable.
 
-The `dt_arg` and `dt_conf` fields provide safe extensibility for advanced darktable options. They are passed as individual argv tokens, validated, and checked against a denylist. Raw shell command strings are intentionally **not** supported because they would bypass all injection protections.
+### Always-on hardening
+
+These protections are always active regardless of security level:
+
+| Protection | Description |
+|---|---|
+| **No shell injection** | Commands are always Python lists, never concatenated strings. `shell=True` is never used. |
+| **No path traversal** | Uploaded filenames are never used as filesystem paths. Temp filenames are generated internally. |
+| **Safe temp files** | Dedicated temp directory. Cleanup runs via background task or immediately on error. |
+| **Input validation** | Upload size limits, integer range checks, format allowlists, extension allowlists. |
+| **Bounded concurrency** | `asyncio.Semaphore` limits parallel renders. Excess requests get 504. |
+| **Timeout protection** | `darktable-cli` is killed after `REQUEST_TIMEOUT` seconds. |
+| **Container hardening** | Runs as non-root user `dtuser` inside Docker. |
+
+### Access security (optional layer)
+
+Set `ACCESS_SECURITY_ENABLED=true` to enable (automatically forced on at `SECURITY_LEVEL=3`):
+
+| Feature | Variable | Description |
+|---|---|---|
+| API key | `ACCESS_REQUIRE_API_KEY=true` + `API_KEY=...` | Require `X-API-Key` header on protected endpoints |
+| Localhost only | `ACCESS_LOCALHOST_ONLY=true` | Only allow loopback IPs (direct socket, no proxy trust) |
+| IP allowlist | `ACCESS_ENABLE_IP_ALLOWLIST=true` + `ACCESS_IP_ALLOWLIST=...` | Comma-separated IPs/CIDRs |
+| CORS restriction | `ACCESS_ENABLE_CORS_RESTRICTION=true` + `ACCESS_CORS_ALLOWED_ORIGINS=...` | Browser-only protection |
+| Rate limiting | `ACCESS_ENABLE_RATE_LIMIT=true` + `ACCESS_RATE_LIMIT_RPM=60` | In-memory per-IP sliding window |
+
+All IP-based checks use `request.client.host` only — no `X-Forwarded-For` or proxy headers are trusted.
 
 ## API reference
 
@@ -50,66 +75,63 @@ The `dt_arg` and `dt_conf` fields provide safe extensibility for advanced darkta
 
 ### `POST /render`
 
-Multipart form upload. Returns the rendered image as binary response.
+Raw binary body + query parameters. Returns the rendered image as binary response.
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `file` | file | *required* | RAW file upload |
-| `output_format` | string | `jpg` | `jpg`, `jpeg`, `png`, `tif`, `tiff` |
-| `width` | int | `0` (no limit) | Max width (0 = darktable default) |
-| `height` | int | `0` (no limit) | Max height (0 = darktable default) |
-| `quality` | int | `80` | JPEG quality (1-100) |
-| `hq` | bool | `false` | High quality resampling |
-| `upscale` | bool | `false` | Allow upscaling |
-| `apply_custom_presets` | bool | `false` | Apply custom presets |
-| `dt_arg` | string (repeated) | | Extra darktable-cli argv tokens |
-| `dt_conf` | string (repeated) | | Extra `--conf key=value` entries |
-
-Error responses are JSON:
-- `400` invalid parameters
-- `413` upload too large
-- `415` unsupported file type
-- `500` render failure
-- `504` timeout
-
-### `POST /preview`
-
-Fixed server-side preset endpoint optimised for server-to-server integration (e.g. Nextcloud). The RAW file is sent as the **raw HTTP request body** (not multipart form-data). All rendering settings come exclusively from application configuration.
+**Headers:**
 
 | Header | Required | Description |
 |---|---|---|
-| `Content-Type` | yes | Must be `application/octet-stream` |
-| `X-Filename` | yes | Original filename (e.g. `IMG_001.dng`). Used to determine source format and to set the output filename. |
-| `X-API-Key` | if configured | API key (same as `/render`) |
+| `Content-Type` | yes | `application/octet-stream` |
+| `X-Filename` | yes | Original filename (e.g. `IMG_001.dng`) |
+| `X-API-Key` | if configured | API key |
 
-**Request body:** raw binary file content (the RAW/DNG file).
+**Query parameters:**
 
-**Response:** rendered preview image as binary body with appropriate `Content-Type` (e.g. `image/jpeg`) and `Content-Disposition: inline; filename="<basename>.<preview ext>"`.
+| Parameter | Default | Description |
+|---|---|---|
+| `output_format` | `jpg` | `jpg`, `jpeg`, `png`, `tif`, `tiff` |
+| `width` | `0` (no limit) | Max width (0 = darktable default) |
+| `height` | `0` (no limit) | Max height |
+| `quality` | `80` | JPEG quality (1-100) |
+| `hq` | `false` | High quality resampling |
+| `upscale` | `false` | Allow upscaling |
+| `apply_custom_presets` | `false` | Apply custom presets |
+| `dt_arg` | | Extra darktable-cli argv tokens (repeated, level 3 only) |
+| `dt_conf` | | Extra `--conf key=value` entries (repeated, level 3 only) |
 
-Error responses are JSON (same codes as `/render`).
+**Error responses (JSON):** 400, 403, 413, 415, 500, 504
 
-```bash
-curl -X POST http://localhost:8000/preview \
-  -H "Content-Type: application/octet-stream" \
-  -H "X-Filename: IMG20251231222841.dng" \
-  --data-binary "@/path/to/IMG20251231222841.dng" \
-  -o IMG20251231222841.jpg
-```
+### `POST /preview`
+
+Fixed server-side preset endpoint. The RAW file is sent as the raw HTTP body. All rendering settings come from server configuration.
+
+**Headers:**
+
+| Header | Required | Description |
+|---|---|---|
+| `Content-Type` | yes | `application/octet-stream` |
+| `X-Filename` | yes | Original filename (e.g. `IMG_001.dng`) |
+| `X-API-Key` | if configured | API key |
+
+**Response:** rendered image with `Content-Type` (e.g. `image/jpeg`) and `Content-Disposition: inline; filename="<name>.<ext>"`.
+
+**Error responses (JSON):** 400, 413, 415, 500, 504
 
 ## Configuration
 
-All settings can be configured via CLI args, environment variables, `.env` file, or Docker Compose. Precedence: CLI > env > `.env` > defaults.
+All settings via environment variables, `.env` file, or Docker Compose. See `.env.example` for the full list.
 
 | Variable | Default | Description |
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8000` | Bind port |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
+| `SECURITY_LEVEL` | `2` | 1, 2, or 3 (see table above) |
 | `MAX_UPLOAD_BYTES` | `209715200` (200 MB) | Maximum upload size |
 | `REQUEST_TIMEOUT` | `120` | darktable-cli timeout in seconds |
 | `MAX_CONCURRENT_RENDERS` | `4` | Concurrent render limit |
 | `TEMP_DIR` | `/tmp/darktable-work` | Working directory for temp files |
-| `API_KEY` | *(empty)* | If set, require `X-API-Key` header |
+| `API_KEY` | *(empty)* | API key value (used with `ACCESS_REQUIRE_API_KEY`) |
 | `PREVIEW_FORMAT` | `jpg` | Preview output format |
 | `PREVIEW_QUALITY` | `80` | Preview JPEG quality |
 | `PREVIEW_WIDTH` | `2000` | Preview max width |
@@ -119,7 +141,15 @@ All settings can be configured via CLI args, environment variables, `.env` file,
 | `PREVIEW_APPLY_CUSTOM_PRESETS` | `false` | Preview custom presets |
 | `ALLOWED_OUTPUT_FORMATS` | `jpg,jpeg,png,tif,tiff` | Allowed output formats |
 | `ALLOWED_RAW_EXTENSIONS` | `.dng,.arw,.nef,...` | Allowed input extensions |
-| `DT_ARG_DENYLIST` | *(empty)* | Comma-separated denied dt_arg tokens |
+| `ACCESS_SECURITY_ENABLED` | `false` | Master switch for access features |
+| `ACCESS_REQUIRE_API_KEY` | `false` | Require API key header |
+| `ACCESS_LOCALHOST_ONLY` | `false` | Restrict to localhost |
+| `ACCESS_ENABLE_IP_ALLOWLIST` | `false` | Enable IP allowlist |
+| `ACCESS_IP_ALLOWLIST` | *(empty)* | Comma-separated IPs/CIDRs |
+| `ACCESS_ENABLE_CORS_RESTRICTION` | `false` | Enable CORS restriction |
+| `ACCESS_CORS_ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins |
+| `ACCESS_ENABLE_RATE_LIMIT` | `false` | Enable rate limiting |
+| `ACCESS_RATE_LIMIT_RPM` | `60` | Requests per minute per IP |
 
 ## Quick start
 
@@ -135,8 +165,6 @@ docker run --rm -p 8000:8000 darktable-cli-server
 ```bash
 docker compose up --build
 ```
-
-Edit `docker-compose.yml` environment variables to customize preview defaults.
 
 ### Local Python
 
@@ -159,13 +187,11 @@ curl http://localhost:8000/health
 ### Render a RAW file to JPEG
 
 ```bash
-curl -X POST http://localhost:8000/render \
-  -F "file=@/path/to/IMG_001.dng" \
-  -F "output_format=jpg" \
-  -F "width=2000" \
-  -F "height=2000" \
-  -F "quality=90" \
-  -o IMG_001.jpg
+curl -X POST "http://localhost:8000/render?output_format=jpg&width=2000&quality=90" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: IMG_001.dng" \
+  --data-binary "@/path/to/IMG_001.dng" \
+  -OJ
 ```
 
 ### Preview with server defaults
@@ -175,37 +201,47 @@ curl -X POST http://localhost:8000/preview \
   -H "Content-Type: application/octet-stream" \
   -H "X-Filename: IMG_001.dng" \
   --data-binary "@/path/to/IMG_001.dng" \
-  -o IMG_001_preview.jpg
+  -OJ
 ```
 
 ### Render to PNG
 
 ```bash
-curl -X POST http://localhost:8000/render \
-  -F "file=@/path/to/photo.arw" \
-  -F "output_format=png" \
-  -F "width=4000" \
-  -o photo.png
+curl -X POST "http://localhost:8000/render?output_format=png&width=4000" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: photo.arw" \
+  --data-binary "@/path/to/photo.arw" \
+  -OJ
 ```
 
 ### With API key
 
 ```bash
-curl -X POST http://localhost:8000/render \
+curl -X POST "http://localhost:8000/render?quality=90" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: photo.dng" \
   -H "X-API-Key: your-secret-key" \
-  -F "file=@photo.dng" \
-  -o photo.jpg
+  --data-binary "@photo.dng" \
+  -OJ
 ```
 
-### Advanced: extra darktable options
+### Advanced: extra darktable options (level 3 only)
 
 ```bash
-curl -X POST http://localhost:8000/render \
-  -F "file=@photo.dng" \
-  -F "dt_arg=--verbose" \
-  -F "dt_conf=plugins/imageio/format/jpeg/quality=95" \
-  -o photo.jpg
+curl -X POST "http://localhost:8000/render?dt_arg=--verbose&dt_conf=plugins/imageio/format/jpeg/quality=95" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Filename: photo.dng" \
+  --data-binary "@photo.dng" \
+  -OJ
 ```
+
+### Postman
+
+1. Method: `POST`, URL: `http://localhost:8000/render?output_format=jpg&quality=90`
+2. Headers tab: set `X-Filename` to your filename (e.g. `photo.dng`)
+3. Body tab → select **binary** → choose your RAW file
+4. If API key is required: add `X-API-Key` header
+5. Send and save the response
 
 ## Running tests
 
@@ -214,7 +250,13 @@ pip install -r requirements.txt
 pytest -v
 ```
 
-Tests cover: filename sanitization, parameter validation, command building, endpoint responses, and API key auth.
+## Deployment recommendations
+
+- **SECURITY_LEVEL=1** for pure preview integrations (minimal attack surface)
+- **SECURITY_LEVEL=2** (default) for general use with safe parameter control
+- **SECURITY_LEVEL=3** only when you need `dt_arg`/`dt_conf` passthrough — always combine with access security
+- Use a reverse proxy (nginx, Traefik) for TLS termination and additional rate limiting
+- For multi-worker deployments, use an external rate limiter instead of the built-in one
 
 ## Limitations
 
@@ -222,5 +264,5 @@ Tests cover: filename sanitization, parameter validation, command building, endp
 - No job queue or caching (by design for simplicity).
 - No persistent storage of results.
 - TIFF output quality is not configurable via `--conf` (darktable limitation).
-- The service trusts the network it runs on unless `API_KEY` is set.
+- Rate limiter is in-memory, single-worker only.
 - Sidecar `.xmp` files are not supported via the API.

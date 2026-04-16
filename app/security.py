@@ -1,23 +1,26 @@
-"""Security utilities: API key auth, filename sanitization, input validation."""
+"""Security utilities: middlewares, filename sanitization, input validation."""
 
 from __future__ import annotations
 
 import logging
 import re
+import time
 import unicodedata
+from collections import defaultdict
+from ipaddress import IPv4Network, IPv6Network
 from pathlib import PurePosixPath
-from typing import Optional
+from typing import Sequence
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app.config import Settings
-
 logger = logging.getLogger("darktable_server.security")
 
-# --- filename sanitization ---
+# ---------------------------------------------------------------------------
+# Filename sanitization
+# ---------------------------------------------------------------------------
 
 _SAFE_FILENAME_RE = re.compile(r"[^\w\-.]")
 
@@ -39,7 +42,9 @@ def derive_output_filename(original_filename: str, output_ext: str) -> str:
     return f"{stem}.{ext}"
 
 
-# --- parameter validators ---
+# ---------------------------------------------------------------------------
+# Parameter validators
+# ---------------------------------------------------------------------------
 
 def validate_int(name: str, value: str | int, lo: int, hi: int) -> int:
     try:
@@ -69,11 +74,13 @@ def validate_output_format(fmt: str, allowed: set[str]) -> str:
     return fmt
 
 
-# --- dt_arg / dt_conf safety ---
+# ---------------------------------------------------------------------------
+# dt_arg / dt_conf safety
+# ---------------------------------------------------------------------------
 
 _DANGEROUS_ARG_PATTERNS = re.compile(
     r"^(--|)("
-    r"output|input|"          # must not override file paths
+    r"output|input|"
     r"out|"
     r"help|version"
     r")$",
@@ -81,8 +88,12 @@ _DANGEROUS_ARG_PATTERNS = re.compile(
 )
 
 
-def validate_dt_arg(token: str, denylist: set[str]) -> str:
-    """Validate a single extra darktable-cli argv token."""
+def validate_dt_arg(token: str) -> str:
+    """Validate a single extra darktable-cli argv token.
+
+    Level 2 blocks dt_arg entirely (handled in endpoint code).
+    Level 3 allows them, but we still validate for safety.
+    """
     token = token.strip()
     if not token:
         raise ValueError("Empty dt_arg token")
@@ -93,8 +104,6 @@ def validate_dt_arg(token: str, denylist: set[str]) -> str:
     low = token.lower()
     if _DANGEROUS_ARG_PATTERNS.match(low):
         raise ValueError(f"dt_arg '{token}' is not allowed (reserved)")
-    if denylist and low in denylist:
-        raise ValueError(f"dt_arg '{token}' is denied by server policy")
     return token
 
 
@@ -112,28 +121,12 @@ def validate_dt_conf(token: str) -> str:
     return token
 
 
-# --- API key middleware ---
+# ---------------------------------------------------------------------------
+# Always-on hardening middleware
+# ---------------------------------------------------------------------------
 
-class APIKeyMiddleware(BaseHTTPMiddleware):
-    """If ``api_key`` is configured, require ``X-API-Key`` header on all non-health endpoints."""
+_OPEN_PATHS = frozenset(("/health", "/version", "/docs", "/redoc", "/openapi.json"))
 
-    def __init__(self, app: object, settings: Settings) -> None:
-        super().__init__(app)  # type: ignore[arg-type]
-        self._api_key: Optional[str] = settings.api_key
-
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if self._api_key is None:
-            return await call_next(request)
-        path = request.url.path.rstrip("/")
-        if path in ("/health", "/version", "/docs", "/redoc", "/openapi.json"):
-            return await call_next(request)
-        provided = request.headers.get("X-API-Key")
-        if provided != self._api_key:
-            return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
-        return await call_next(request)
-
-
-# --- upload-size middleware ---
 
 class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
     """Reject requests whose Content-Length exceeds the configured maximum."""
@@ -153,4 +146,106 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
                     )
             except ValueError:
                 pass
+        return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Access-security middlewares (conditional, gated by effective config)
+# ---------------------------------------------------------------------------
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Require ``X-API-Key`` header on non-open endpoints."""
+
+    def __init__(self, app: object, api_key: str) -> None:
+        super().__init__(app)  # type: ignore[arg-type]
+        self._api_key = api_key
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path.rstrip("/")
+        if path in _OPEN_PATHS:
+            return await call_next(request)
+        provided = request.headers.get("X-API-Key")
+        if provided != self._api_key:
+            return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
+        return await call_next(request)
+
+
+class LocalhostOnlyMiddleware(BaseHTTPMiddleware):
+    """Allow only loopback addresses (direct socket IP, no proxy trust)."""
+
+    _LOOPBACK = frozenset(("127.0.0.1", "::1"))
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path.rstrip("/")
+        if path in _OPEN_PATHS:
+            return await call_next(request)
+        client_ip = request.client.host if request.client else None
+        if client_ip not in self._LOOPBACK:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Access restricted to localhost"},
+            )
+        return await call_next(request)
+
+
+class IPAllowlistMiddleware(BaseHTTPMiddleware):
+    """Allow only IPs matching configured networks (direct socket IP, no proxy trust)."""
+
+    def __init__(
+        self, app: object, networks: Sequence[IPv4Network | IPv6Network],
+    ) -> None:
+        super().__init__(app)  # type: ignore[arg-type]
+        self._networks = list(networks)
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path.rstrip("/")
+        if path in _OPEN_PATHS:
+            return await call_next(request)
+        client_ip = request.client.host if request.client else None
+        if client_ip is None:
+            return JSONResponse(status_code=403, content={"error": "No client IP"})
+        from ipaddress import ip_address
+        try:
+            addr = ip_address(client_ip)
+        except ValueError:
+            return JSONResponse(status_code=403, content={"error": "Invalid client IP"})
+        for net in self._networks:
+            if addr in net:
+                return await call_next(request)
+        return JSONResponse(
+            status_code=403,
+            content={"error": "IP address not in allowlist"},
+        )
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """In-memory sliding-window rate limiter per client IP.
+
+    Single-worker only. For multi-worker deployments, use an external
+    rate-limiter (e.g. nginx, Traefik, or a Redis-backed solution).
+    """
+
+    def __init__(self, app: object, rpm: int) -> None:
+        super().__init__(app)  # type: ignore[arg-type]
+        self._rpm = rpm
+        self._window = 60.0
+        self._requests: dict[str, list[float]] = defaultdict(list)
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path.rstrip("/")
+        if path in _OPEN_PATHS:
+            return await call_next(request)
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        cutoff = now - self._window
+        # prune old entries
+        bucket = self._requests[client_ip]
+        self._requests[client_ip] = [t for t in bucket if t > cutoff]
+        bucket = self._requests[client_ip]
+        if len(bucket) >= self._rpm:
+            return JSONResponse(
+                status_code=429,
+                content={"error": "Rate limit exceeded"},
+            )
+        bucket.append(now)
         return await call_next(request)

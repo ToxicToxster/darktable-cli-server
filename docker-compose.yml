@@ -11,6 +11,7 @@ services:
       - MAX_UPLOAD_BYTES=209715200
       - REQUEST_TIMEOUT=120
       - MAX_CONCURRENT_RENDERS=4
+      - SECURITY_LEVEL=2
       - PREVIEW_FORMAT=jpg
       - PREVIEW_QUALITY=80
       - PREVIEW_WIDTH=2000
@@ -18,4 +19,14 @@ services:
       - PREVIEW_HQ=false
       - PREVIEW_UPSCALE=false
       - PREVIEW_APPLY_CUSTOM_PRESETS=false
+      # --- Access security (uncomment to enable) ---
+      # - ACCESS_SECURITY_ENABLED=true
       # - API_KEY=your-secret-key
+      # - ACCESS_REQUIRE_API_KEY=true
+      # - ACCESS_LOCALHOST_ONLY=false
+      # - ACCESS_ENABLE_IP_ALLOWLIST=false
+      # - ACCESS_IP_ALLOWLIST=192.168.1.0/24
+      # - ACCESS_ENABLE_CORS_RESTRICTION=false
+      # - ACCESS_CORS_ALLOWED_ORIGINS=https://example.com
+      # - ACCESS_ENABLE_RATE_LIMIT=false
+      # - ACCESS_RATE_LIMIT_RPM=60
