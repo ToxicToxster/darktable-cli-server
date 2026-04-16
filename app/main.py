@@ -1,233 +1,283 @@
-import logging
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Any, Optional
+"""darktable-cli-server: production-grade HTTP wrapper around darktable-cli."""
 
-from fastapi import FastAPI, File, Form, UploadFile
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator, Optional
+
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
-logger = logging.getLogger("raw_renderer")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+from app.config import Settings, get_app_version, get_darktable_version, get_settings
+from app.deps import get_semaphore, init_semaphore
+from app.models import ErrorResponse, HealthResponse, VersionResponse
+from app.security import (
+    APIKeyMiddleware,
+    MaxUploadSizeMiddleware,
+    derive_output_filename,
+    validate_bool,
+    validate_dt_arg,
+    validate_dt_conf,
+    validate_int,
+    validate_output_format,
 )
+from app.services.darktable import FORMAT_EXTENSION_MAP, RenderParams, get_darktable_cli_path, run_render
+from app.services.files import cleanup_temp_dir, create_temp_dir, write_upload
 
-SUPPORTED_EXTENSIONS = {
-    ".dng",
-    ".arw",
-    ".nef",
-    ".cr2",
-    ".cr3",
-    ".orf",
-    ".rw2",
-    ".raf",
-}
-RENDER_TIMEOUT_SECONDS = 90
+logger = logging.getLogger("darktable_server")
 
 
-def get_darktable_cli_path() -> Optional[str]:
-    return shutil.which("darktable-cli")
+def create_app(settings: Optional[Settings] = None) -> FastAPI:
+    if settings is None:
+        settings = get_settings()
 
-
-def cleanup_tmpdir(path: Path) -> None:
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-        logger.debug("Temporary directory removed: %s", path)
-    except Exception:
-        logger.exception("Failed to remove temporary directory: %s", path)
-
-
-def error_response(status_code: int, message: str, details: Optional[Any] = None) -> JSONResponse:
-    payload = {"error": message}
-    if details is not None:
-        payload["details"] = details
-    return JSONResponse(status_code=status_code, content=payload)
-
-
-def parse_int_field(name: str, raw_value: str, minimum: int, maximum: int) -> int:
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        raise ValueError(f"Parameter '{name}' muss eine Ganzzahl sein") from None
-    if value < minimum or value > maximum:
-        raise ValueError(f"Parameter '{name}' muss zwischen {minimum} und {maximum} liegen")
-    return value
-
-
-def parse_binary_int_field(name: str, raw_value: str) -> int:
-    value = parse_int_field(name, raw_value, 0, 1)
-    if value not in (0, 1):
-        raise ValueError(f"Parameter '{name}' muss 0 oder 1 sein")
-    return value
-
-
-def parse_bool_field(name: str, raw_value: str) -> bool:
-    normalized = str(raw_value).strip().lower()
-    truthy = {"1", "true", "yes", "on"}
-    falsy = {"0", "false", "no", "off"}
-    if normalized in truthy:
-        return True
-    if normalized in falsy:
-        return False
-    raise ValueError(
-        f"Parameter '{name}' muss ein Boolean sein (erlaubt: true/false/1/0/yes/no/on/off)"
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=True,
     )
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        init_semaphore(settings.max_concurrent_renders)
+        Path(settings.temp_dir).mkdir(parents=True, exist_ok=True)
+        cli = get_darktable_cli_path()
+        if cli:
+            logger.info("darktable-cli found: %s", cli)
+        else:
+            logger.warning("darktable-cli NOT found — /render and /preview will fail")
+        yield
 
-app = FastAPI(title="darktable-cli-server")
+    application = FastAPI(
+        title="darktable-cli-server",
+        version=get_app_version(),
+        docs_url="/docs",
+        redoc_url="/redoc",
+        lifespan=lifespan,
+    )
 
+    application.add_middleware(MaxUploadSizeMiddleware, max_bytes=settings.max_upload_bytes)
+    application.add_middleware(APIKeyMiddleware, settings=settings)
 
-@app.on_event("startup")
-def startup_check() -> None:
-    cli_path = get_darktable_cli_path()
-    if cli_path:
-        logger.info("darktable-cli gefunden: %s", cli_path)
-    else:
-        logger.error(
-            "darktable-cli wurde nicht gefunden. Der Endpunkt /render wird mit HTTP 500 antworten, "
-            "bis darktable-cli im Container installiert ist."
+    @application.get("/health", response_model=HealthResponse)
+    def health() -> HealthResponse:
+        return HealthResponse(status="ok")
+
+    @application.get("/version", response_model=VersionResponse)
+    def version() -> VersionResponse:
+        return VersionResponse(
+            app_version=get_app_version(),
+            python_version=sys.version,
+            darktable_cli_available=get_darktable_cli_path() is not None,
+            darktable_version=get_darktable_version(),
         )
 
+    @application.post(
+        "/render",
+        response_model=None,
+        responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse},
+                   415: {"model": ErrorResponse}, 500: {"model": ErrorResponse},
+                   504: {"model": ErrorResponse}},
+    )
+    async def render(
+        request: Request,
+        file: UploadFile = File(...),
+        output_format: str = Form("jpg"),
+        width: str = Form("0"),
+        height: str = Form("0"),
+        quality: str = Form("80"),
+        hq: str = Form("0"),
+        upscale: str = Form("0"),
+        apply_custom_presets: str = Form("false"),
+    ) -> FileResponse | JSONResponse:
+        form = await request.form()
+        dt_args: list[str] = [
+            v for k, v in form.multi_items() if k == "dt_arg" and isinstance(v, str)
+        ]
+        dt_confs: list[str] = [
+            v for k, v in form.multi_items() if k == "dt_conf" and isinstance(v, str)
+        ]
+        return await _do_render(
+            file=file, output_format=output_format, width=width, height=height,
+            quality=quality, hq=hq, upscale=upscale,
+            apply_custom_presets=apply_custom_presets,
+            dt_args=dt_args, dt_confs=dt_confs, settings=settings, endpoint="render",
+        )
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "darktable_cli_available": get_darktable_cli_path() is not None,
-    }
+    @application.post(
+        "/preview",
+        response_model=None,
+        responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse},
+                   415: {"model": ErrorResponse}, 500: {"model": ErrorResponse},
+                   504: {"model": ErrorResponse}},
+    )
+    async def preview(
+        request: Request,
+        file: UploadFile = File(...),
+        output_format: Optional[str] = Form(None),
+        width: Optional[str] = Form(None),
+        height: Optional[str] = Form(None),
+        quality: Optional[str] = Form(None),
+        hq: Optional[str] = Form(None),
+        upscale: Optional[str] = Form(None),
+        apply_custom_presets: Optional[str] = Form(None),
+    ) -> FileResponse | JSONResponse:
+        if not settings.preview_allow_overrides:
+            output_format = None
+            width = height = quality = hq = upscale = apply_custom_presets = None
+
+        return await _do_render(
+            file=file,
+            output_format=output_format or settings.preview_format,
+            width=width if width is not None else str(settings.preview_width),
+            height=height if height is not None else str(settings.preview_height),
+            quality=quality if quality is not None else str(settings.preview_quality),
+            hq=hq if hq is not None else str(settings.preview_hq).lower(),
+            upscale=upscale if upscale is not None else str(settings.preview_upscale).lower(),
+            apply_custom_presets=(
+                apply_custom_presets if apply_custom_presets is not None
+                else str(settings.preview_apply_custom_presets).lower()
+            ),
+            dt_args=[], dt_confs=[], settings=settings, endpoint="preview",
+        )
+
+    return application
 
 
-@app.post("/render")
-async def render_raw_to_jpeg(
-    file: UploadFile = File(...),
-    width: str = Form("2000"),
-    height: str = Form("2000"),
-    quality: str = Form("80"),
-    hq: str = Form("0"),
-    upscale: str = Form("0"),
-    apply_custom_presets: str = Form("false"),
-):
-    temp_dir = Path(tempfile.mkdtemp(prefix="raw-render-"))
-    cleanup_in_finally = True
+def _error(status: int, msg: str, details: object = None) -> JSONResponse:
+    payload: dict = {"error": msg}
+    if details is not None:
+        payload["details"] = details
+    return JSONResponse(status_code=status, content=payload)
+
+
+async def _do_render(
+    *,
+    file: UploadFile,
+    output_format: str,
+    width: str,
+    height: str,
+    quality: str,
+    hq: str,
+    upscale: str,
+    apply_custom_presets: str,
+    dt_args: list[str],
+    dt_confs: list[str],
+    settings: Settings,
+    endpoint: str,
+) -> FileResponse | JSONResponse:
+    allowed_formats = settings.allowed_output_formats_set()
+    allowed_exts = settings.allowed_raw_extensions_set()
+    denylist = settings.dt_arg_denylist_set()
 
     try:
-        cli_path = get_darktable_cli_path()
-        if cli_path is None:
-            return error_response(
-                500,
-                "darktable-cli ist nicht verfuegbar",
-                "Installiere darktable-cli im Laufzeitumfeld und starte den Service neu.",
-            )
+        fmt = validate_output_format(output_format, allowed_formats)
+        w = validate_int("width", width, 0, 16000)
+        h = validate_int("height", height, 0, 16000)
+        q = validate_int("quality", quality, 1, 100)
+        hq_val = validate_bool("hq", hq)
+        up_val = validate_bool("upscale", upscale)
+        acp_val = validate_bool("apply_custom_presets", apply_custom_presets)
+    except ValueError as exc:
+        return _error(400, "Invalid parameters", str(exc))
+
+    safe_args: list[str] = []
+    safe_confs: list[str] = []
+    try:
+        for a in dt_args:
+            safe_args.append(validate_dt_arg(a, denylist))
+        for c in dt_confs:
+            safe_confs.append(validate_dt_conf(c))
+    except ValueError as exc:
+        return _error(400, "Invalid advanced parameter", str(exc))
+
+    if not file.filename:
+        return _error(400, "No file uploaded")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in allowed_exts:
+        return _error(415, "Unsupported file type", {
+            "extension": ext, "allowed": sorted(allowed_exts),
+        })
+
+    temp_dir = create_temp_dir(settings.temp_dir)
+    cleanup_needed = True
+
+    try:
+        out_ext = FORMAT_EXTENSION_MAP.get(fmt, f".{fmt}")
+        input_path = temp_dir / f"input{ext}"
+        output_path = temp_dir / f"output{out_ext}"
+
+        size = await write_upload(file, input_path)
+        await file.close()
+
+        if size == 0:
+            return _error(400, "Uploaded file is empty")
+        if size > settings.max_upload_bytes:
+            return _error(413, "Upload exceeds maximum size")
+
+        params = RenderParams(
+            width=w if w > 0 else None,
+            height=h if h > 0 else None,
+            hq=hq_val,
+            upscale=up_val,
+            apply_custom_presets=acp_val,
+            output_format=fmt,
+            quality=q,
+            extra_args=safe_args,
+            extra_confs=safe_confs,
+        )
+
+        sem = get_semaphore()
+        try:
+            async with asyncio.timeout(settings.request_timeout + 5):
+                await sem.acquire()
+        except TimeoutError:
+            return _error(504, "Server too busy, render queue full")
 
         try:
-            width_value = parse_int_field("width", width, 1, 8000)
-            height_value = parse_int_field("height", height, 1, 8000)
-            quality_value = parse_int_field("quality", quality, 1, 100)
-            hq_value = parse_binary_int_field("hq", hq)
-            upscale_value = parse_binary_int_field("upscale", upscale)
-            apply_custom_presets_value = parse_bool_field("apply_custom_presets", apply_custom_presets)
-        except ValueError as exc:
-            return error_response(400, "Ungueltige Anfrageparameter", str(exc))
-
-        if not file.filename:
-            return error_response(400, "Keine Datei hochgeladen")
-
-        suffix = Path(file.filename).suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
-            return error_response(
-                415,
-                "Nicht unterstuetzter Dateityp",
-                {
-                    "received_extension": suffix or "",
-                    "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
-                },
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, run_render, input_path, output_path, params, settings.request_timeout,
             )
+        finally:
+            sem.release()
 
-        input_path = temp_dir / f"input{suffix}"
-        output_path = temp_dir / "output.jpg"
+        if not result.success:
+            if result.error and "timed out" in result.error.lower():
+                return _error(504, "Render timeout", {"seconds": settings.request_timeout})
+            return _error(500, "Render failed", {
+                "message": result.error,
+                "returncode": result.returncode,
+                "stderr": (result.stderr or "")[:1000],
+            })
 
-        with input_path.open("wb") as input_file:
-            shutil.copyfileobj(file.file, input_file)
+        response_filename = derive_output_filename(file.filename, out_ext.lstrip("."))
+        media = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{out_ext.lstrip('.')}"
+        if fmt in ("tif", "tiff"):
+            media = "image/tiff"
+        if fmt == "png":
+            media = "image/png"
 
-        if not input_path.exists() or input_path.stat().st_size == 0:
-            return error_response(400, "Die hochgeladene Datei ist leer")
+        logger.info(
+            "endpoint=%s format=%s filename=%s duration=%.1fs",
+            endpoint, fmt, response_filename, result.duration_seconds,
+        )
 
-        cmd = [
-            cli_path,
-            str(input_path),
-            str(output_path),
-            "--width",
-            str(width_value),
-            "--height",
-            str(height_value),
-            "--hq",
-            str(hq_value),
-            "--upscale",
-            str(upscale_value),
-            "--apply-custom-presets",
-            "true" if apply_custom_presets_value else "false",
-            "--core",
-            "--conf",
-            f"plugins/imageio/format/jpeg/quality={quality_value}",
-        ]
-
-        logger.info("Starte Rendering mit darktable-cli")
-        logger.debug("darktable-cli command: %s", cmd)
-
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=RENDER_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            logger.error("darktable-cli timeout nach %s Sekunden", RENDER_TIMEOUT_SECONDS)
-            return error_response(
-                504,
-                "Rendering-Timeout",
-                {"timeout_seconds": RENDER_TIMEOUT_SECONDS, "stderr": exc.stderr or ""},
-            )
-        except FileNotFoundError:
-            logger.exception("darktable-cli wurde beim Ausfuehren nicht gefunden")
-            return error_response(
-                500,
-                "darktable-cli ist nicht installiert oder nicht im PATH",
-            )
-
-        logger.info("darktable-cli exit code: %s", result.returncode)
-        if result.stdout:
-            logger.info("darktable-cli stdout: %s", result.stdout.strip())
-        if result.stderr:
-            logger.warning("darktable-cli stderr: %s", result.stderr.strip())
-
-        if result.returncode != 0:
-            return error_response(
-                500,
-                "Render-Fehler durch darktable-cli",
-                {
-                    "returncode": result.returncode,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                },
-            )
-
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            return error_response(500, "Kein gueltiges JPEG erzeugt")
-
-        cleanup_in_finally = False
+        cleanup_needed = False
         return FileResponse(
-            path=output_path,
-            media_type="image/jpeg",
-            headers={"Content-Disposition": 'inline; filename="preview.jpg"'},
-            background=BackgroundTask(cleanup_tmpdir, temp_dir),
+            path=result.output_path,
+            media_type=media,
+            headers={"Content-Disposition": f'inline; filename="{response_filename}"'},
+            background=BackgroundTask(cleanup_temp_dir, temp_dir),
         )
     finally:
-        await file.close()
-        if cleanup_in_finally:
-            cleanup_tmpdir(temp_dir)
+        if cleanup_needed:
+            cleanup_temp_dir(temp_dir)
+
+
+app = create_app()

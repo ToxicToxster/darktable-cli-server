@@ -6,7 +6,11 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .mypy_cache/
+.venv/
+venv/
 tests/
+testfile/
 *.log
 README.md
-testfile/
+.env
+.env.example

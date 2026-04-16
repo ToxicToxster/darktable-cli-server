@@ -1,1 +1,1 @@
-"""darktable RAW renderer service package."""
+"""darktable-cli-server: HTTP wrapper around darktable-cli."""

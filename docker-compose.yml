@@ -1,8 +1,22 @@
 services:
-  raw-renderer:
+  darktable-cli-server:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "8000:8000"
     restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - MAX_UPLOAD_BYTES=209715200
+      - REQUEST_TIMEOUT=120
+      - MAX_CONCURRENT_RENDERS=4
+      - PREVIEW_FORMAT=jpg
+      - PREVIEW_QUALITY=80
+      - PREVIEW_WIDTH=2000
+      - PREVIEW_HEIGHT=2000
+      - PREVIEW_HQ=false
+      - PREVIEW_UPSCALE=false
+      - PREVIEW_APPLY_CUSTOM_PRESETS=false
+      - PREVIEW_ALLOW_OVERRIDES=false
+      # - API_KEY=your-secret-key

@@ -9,13 +9,19 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /srv/raw-renderer
+RUN groupadd -r dtuser && useradd -r -g dtuser -m -s /bin/false dtuser
 
-COPY requirements.txt ./requirements.txt
+WORKDIR /srv/darktable-cli-server
+
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-EXPOSE 8080
+RUN mkdir -p /tmp/darktable-work && chown dtuser:dtuser /tmp/darktable-work
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+USER dtuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
