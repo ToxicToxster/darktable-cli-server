@@ -44,6 +44,27 @@ def client(settings: Settings) -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture()
+def localhost_client_factory():
+    class ClientAddressOverrideApp:
+        def __init__(self, app, host: str, port: int = 50000) -> None:
+            self._app = app
+            self._host = host
+            self._port = port
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                scope = dict(scope)
+                scope["client"] = (self._host, self._port)
+            await self._app(scope, receive, send)
+
+    def factory(settings: Settings, host: str = "testclient") -> TestClient:
+        app = create_app(settings)
+        return TestClient(ClientAddressOverrideApp(app, host))
+
+    return factory
+
+
 def _raw_render(
     client: TestClient,
     filename: str = "test.dng",
@@ -244,7 +265,7 @@ class TestRenderValidation:
         r = client.post("/render", content=b"raw-data",
                         headers={"Content-Type": "application/octet-stream"})
         assert r.status_code == 400
-        assert "X-Filename" in r.json()["detail"]
+        assert "X-Filename" in r.json()["error"]
 
     def test_rejects_unsupported_extension(self, client: TestClient) -> None:
         r = _raw_render(client, filename="test.txt")
@@ -276,7 +297,7 @@ class TestPreviewValidation:
         r = client.post("/preview", content=b"raw-data",
                         headers={"Content-Type": "application/octet-stream"})
         assert r.status_code == 400
-        assert "X-Filename" in r.json()["detail"]
+        assert "X-Filename" in r.json()["error"]
 
     def test_rejects_empty_x_filename(self, client: TestClient) -> None:
         r = _raw_preview(client, filename="  ")
@@ -347,7 +368,7 @@ class TestSecurityLevels:
         c = TestClient(create_app(s))
         r = _raw_render(c, filename="test.dng")
         assert r.status_code == 403
-        assert "disabled" in r.json()["detail"].lower()
+        assert "disabled" in r.json()["error"].lower()
 
     def test_level1_allows_preview(self) -> None:
         s = Settings(security_level=1, temp_dir="/tmp/dt-sec1")
@@ -368,7 +389,7 @@ class TestSecurityLevels:
         c = TestClient(create_app(s))
         r = _raw_render(c, filename="test.dng", params={"dt_arg": "--verbose"})
         assert r.status_code == 403
-        assert "passthrough" in r.json()["detail"].lower()
+        assert "passthrough" in r.json()["error"].lower()
 
     def test_level2_blocks_dt_conf(self) -> None:
         s = Settings(security_level=2, temp_dir="/tmp/dt-sec2")
@@ -402,16 +423,17 @@ class TestSecurityLevels:
 # ---------------------------------------------------------------------------
 
 class TestStartupValidation:
-    def test_level3_requires_access_security(self) -> None:
-        """Level 3 forces effective_access_security = True, which is fine (no crash)."""
+    def test_level3_starts_successfully(self) -> None:
+        """Level 3 forces effective access security internally but startup still succeeds."""
         s = Settings(
             security_level=3, temp_dir="/tmp/dt-val",
-            access_security_enabled=True, access_require_api_key=False,
+            access_security_enabled=False, access_require_api_key=False,
         )
-        # Should not raise
-        s.validate_effective_config()
+        with TestClient(create_app(s)) as client:
+            r = client.get("/health")
+        assert r.status_code == 200
 
-    def test_api_key_required_but_missing_raises(self) -> None:
+    def test_api_key_required_but_missing_raises_on_startup(self) -> None:
         s = Settings(
             security_level=2, temp_dir="/tmp/dt-val",
             access_security_enabled=True,
@@ -419,9 +441,10 @@ class TestStartupValidation:
             api_key=None,
         )
         with pytest.raises(ValueError, match="API_KEY"):
-            s.validate_effective_config()
+            with TestClient(create_app(s)):
+                pass
 
-    def test_ip_allowlist_enabled_but_empty_raises(self) -> None:
+    def test_ip_allowlist_enabled_but_empty_raises_on_startup(self) -> None:
         s = Settings(
             security_level=2, temp_dir="/tmp/dt-val",
             access_security_enabled=True,
@@ -429,7 +452,19 @@ class TestStartupValidation:
             access_ip_allowlist="",
         )
         with pytest.raises(ValueError, match="(?i)allowlist"):
-            s.validate_effective_config()
+            with TestClient(create_app(s)):
+                pass
+
+    def test_cors_enabled_but_empty_origins_raises_on_startup(self) -> None:
+        s = Settings(
+            security_level=2, temp_dir="/tmp/dt-val",
+            access_security_enabled=True,
+            access_enable_cors_restriction=True,
+            access_cors_allowed_origins="",
+        )
+        with pytest.raises(ValueError, match="CORS_ALLOWED_ORIGINS"):
+            with TestClient(create_app(s)):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -476,3 +511,64 @@ class TestAccessSecurity:
             r = _raw_render(c, filename="test.dng")
         # Should NOT be 401 because access security is off
         assert r.status_code != 401
+
+    def test_localhost_only_blocks_non_loopback(self, localhost_client_factory) -> None:
+        s = Settings(
+            temp_dir="/tmp/dt-acc",
+            access_security_enabled=True,
+            access_localhost_only=True,
+        )
+        c = localhost_client_factory(s, host="192.168.1.50")
+        r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 403
+        assert "localhost" in r.json()["error"].lower()
+
+    def test_localhost_only_allows_loopback(self, localhost_client_factory) -> None:
+        s = Settings(
+            temp_dir="/tmp/dt-acc",
+            access_security_enabled=True,
+            access_localhost_only=True,
+        )
+        c = localhost_client_factory(s, host="127.0.0.1")
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 200
+
+    def test_ip_allowlist_blocks_non_matching_ip(self, localhost_client_factory) -> None:
+        s = Settings(
+            temp_dir="/tmp/dt-acc",
+            access_security_enabled=True,
+            access_enable_ip_allowlist=True,
+            access_ip_allowlist="10.0.0.0/24",
+        )
+        c = localhost_client_factory(s, host="192.168.1.50")
+        r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 403
+        assert "allowlist" in r.json()["error"].lower()
+
+    def test_ip_allowlist_allows_matching_ip(self, localhost_client_factory) -> None:
+        s = Settings(
+            temp_dir="/tmp/dt-acc",
+            access_security_enabled=True,
+            access_enable_ip_allowlist=True,
+            access_ip_allowlist="10.0.0.0/24",
+        )
+        c = localhost_client_factory(s, host="10.0.0.25")
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            r = _raw_render(c, filename="test.dng")
+        assert r.status_code == 200
+
+    def test_rate_limit_blocks_second_request(self, localhost_client_factory) -> None:
+        s = Settings(
+            temp_dir="/tmp/dt-acc",
+            access_security_enabled=True,
+            access_enable_rate_limit=True,
+            access_rate_limit_rpm=1,
+        )
+        c = localhost_client_factory(s, host="127.0.0.1")
+        with _DTCLI_PATCH, _DTPATH_PATCH:
+            first = _raw_render(c, filename="test.dng")
+            second = _raw_render(c, filename="test.dng")
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert "rate limit" in second.json()["error"].lower()

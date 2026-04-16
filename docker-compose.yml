@@ -4,9 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     restart: unless-stopped
     environment:
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8000}
       - LOG_LEVEL=info
       - MAX_UPLOAD_BYTES=209715200
       - REQUEST_TIMEOUT=120

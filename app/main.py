@@ -7,16 +7,23 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from app.config import Settings, get_app_version, get_darktable_version, get_settings
 from app.deps import get_semaphore, init_semaphore
-from app.models import ErrorResponse, HealthResponse, VersionResponse
+from app.models import (
+    ErrorResponse,
+    HealthResponse,
+    VersionResponse,
+    build_error_payload,
+    normalize_error_payload,
+)
 from app.security import (
     APIKeyMiddleware,
     IPAllowlistMiddleware,
@@ -37,6 +44,13 @@ from app.services.files import cleanup_temp_dir, create_temp_dir, write_body_to_
 logger = logging.getLogger("darktable_server")
 
 
+def _api_error(status_code: int, error: str, details: Any = None) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=build_error_payload(error, details),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -45,16 +59,16 @@ def _validate_filename_header(request: Request, settings: Settings) -> tuple[str
     """Extract and validate X-Filename. Returns (sanitized_name, extension)."""
     raw = request.headers.get("x-filename")
     if not raw or not raw.strip():
-        raise HTTPException(status_code=400, detail="Missing or empty X-Filename header")
+        raise _api_error(400, "Missing or empty X-Filename header")
     filename = sanitize_filename(raw)
     ext = Path(filename).suffix.lower()
     allowed_exts = settings.allowed_raw_extensions_set()
     if ext not in allowed_exts:
-        raise HTTPException(status_code=415, detail={
-            "error": "Unsupported file type",
-            "extension": ext,
-            "allowed": sorted(allowed_exts),
-        })
+        raise _api_error(
+            415,
+            "Unsupported file type",
+            {"extension": ext, "allowed": sorted(allowed_exts)},
+        )
     return filename, ext
 
 
@@ -92,17 +106,17 @@ async def _render_pipeline(
                 request.stream(), input_path, settings.max_upload_bytes,
             )
         except ValueError:
-            raise HTTPException(status_code=413, detail="Upload exceeds maximum size")
+            raise _api_error(413, "Upload exceeds maximum size")
 
         if size == 0:
-            raise HTTPException(status_code=400, detail="Empty request body")
+            raise _api_error(400, "Empty request body")
 
         sem = get_semaphore()
         try:
             async with asyncio.timeout(settings.request_timeout + 5):
                 await sem.acquire()
         except TimeoutError:
-            raise HTTPException(status_code=504, detail="Server too busy, render queue full")
+            raise _api_error(504, "Server too busy, render queue full")
 
         try:
             loop = asyncio.get_running_loop()
@@ -115,16 +129,16 @@ async def _render_pipeline(
 
         if not result.success:
             if result.error and "timed out" in result.error.lower():
-                raise HTTPException(status_code=504, detail={
-                    "error": "Render timeout",
-                    "seconds": settings.request_timeout,
-                })
-            raise HTTPException(status_code=500, detail={
-                "error": "Render failed",
-                "message": result.error,
-                "returncode": result.returncode,
-                "stderr": (result.stderr or "")[:1000],
-            })
+                raise _api_error(504, "Render timeout", {"seconds": settings.request_timeout})
+            raise _api_error(
+                500,
+                "Render failed",
+                {
+                    "message": result.error,
+                    "returncode": result.returncode,
+                    "stderr": (result.stderr or "")[:1000],
+                },
+            )
 
         response_filename = derive_output_filename(filename, out_ext.lstrip("."))
         media = _media_type(fmt)
@@ -206,6 +220,23 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    @application.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=normalize_error_payload(exc.detail),
+            headers=exc.headers,
+        )
+
+    @application.exception_handler(RequestValidationError)
+    async def request_validation_exception_handler(
+        request: Request, exc: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content=build_error_payload("Request validation failed", exc.errors()),
+        )
+
     # --- always-on hardening middleware ---
     application.add_middleware(MaxUploadSizeMiddleware, max_bytes=settings.max_upload_bytes)
 
@@ -279,15 +310,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ) -> FileResponse:
         # --- security level gating ---
         if not settings.is_render_allowed():
-            raise HTTPException(
-                status_code=403,
-                detail="Render endpoint is disabled at the current SECURITY_LEVEL",
+            raise _api_error(
+                403,
+                "Render endpoint is disabled at the current SECURITY_LEVEL",
             )
         if not settings.is_render_passthrough_allowed() and (dt_arg or dt_conf):
-            raise HTTPException(
-                status_code=403,
-                detail="Advanced darktable passthrough arguments are not allowed "
-                       "at the current SECURITY_LEVEL",
+            raise _api_error(
+                403,
+                "Advanced darktable passthrough arguments are not allowed "
+                "at the current SECURITY_LEVEL",
             )
 
         filename, ext = _validate_filename_header(request, settings)
@@ -303,7 +334,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             up_val = validate_bool("upscale", upscale)
             acp_val = validate_bool("apply_custom_presets", apply_custom_presets)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise _api_error(400, str(exc))
 
         safe_args: list[str] = []
         safe_confs: list[str] = []
@@ -313,7 +344,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             for c in dt_conf:
                 safe_confs.append(validate_dt_conf(c))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise _api_error(400, str(exc))
 
         params = RenderParams(
             width=w if w > 0 else None,

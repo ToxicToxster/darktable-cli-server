@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from app.models import build_error_payload
+
 logger = logging.getLogger("darktable_server.security")
 
 # ---------------------------------------------------------------------------
@@ -142,7 +144,9 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
                 if int(cl) > self._max:
                     return JSONResponse(
                         status_code=413,
-                        content={"error": f"Upload exceeds maximum size of {self._max} bytes"},
+                        content=build_error_payload(
+                            f"Upload exceeds maximum size of {self._max} bytes",
+                        ),
                     )
             except ValueError:
                 pass
@@ -166,7 +170,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         provided = request.headers.get("X-API-Key")
         if provided != self._api_key:
-            return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
+            return JSONResponse(
+                status_code=401,
+                content=build_error_payload("Invalid or missing API key"),
+            )
         return await call_next(request)
 
 
@@ -183,7 +190,7 @@ class LocalhostOnlyMiddleware(BaseHTTPMiddleware):
         if client_ip not in self._LOOPBACK:
             return JSONResponse(
                 status_code=403,
-                content={"error": "Access restricted to localhost"},
+                content=build_error_payload("Access restricted to localhost"),
             )
         return await call_next(request)
 
@@ -203,18 +210,21 @@ class IPAllowlistMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         client_ip = request.client.host if request.client else None
         if client_ip is None:
-            return JSONResponse(status_code=403, content={"error": "No client IP"})
+            return JSONResponse(status_code=403, content=build_error_payload("No client IP"))
         from ipaddress import ip_address
         try:
             addr = ip_address(client_ip)
         except ValueError:
-            return JSONResponse(status_code=403, content={"error": "Invalid client IP"})
+            return JSONResponse(
+                status_code=403,
+                content=build_error_payload("Invalid client IP"),
+            )
         for net in self._networks:
             if addr in net:
                 return await call_next(request)
         return JSONResponse(
             status_code=403,
-            content={"error": "IP address not in allowlist"},
+            content=build_error_payload("IP address not in allowlist"),
         )
 
 
@@ -245,7 +255,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if len(bucket) >= self._rpm:
             return JSONResponse(
                 status_code=429,
-                content={"error": "Rate limit exceeded"},
+                content=build_error_payload("Rate limit exceeded"),
             )
         bucket.append(now)
         return await call_next(request)

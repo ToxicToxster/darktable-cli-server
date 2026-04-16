@@ -26,6 +26,8 @@ Example: upload `IMG20251231222841.dng` → receive `IMG20251231222841.jpg`.
 
 Set via `SECURITY_LEVEL` environment variable.
 
+Level 3 is a **trusted local power-user mode**, not a normal LAN-safe default. It enables advanced passthrough functionality (`dt_arg`, `dt_conf`) and should be treated as a higher-risk operating mode. If you use level 3, combine it with access-security controls and preferably `ACCESS_LOCALHOST_ONLY=true` or similarly strict network restrictions.
+
 ### Always-on hardening
 
 These protections are always active regardless of security level:
@@ -42,17 +44,19 @@ These protections are always active regardless of security level:
 
 ### Access security (optional layer)
 
-Set `ACCESS_SECURITY_ENABLED=true` to enable (automatically forced on at `SECURITY_LEVEL=3`):
+Set `ACCESS_SECURITY_ENABLED=true` to enable. At `SECURITY_LEVEL=3`, access security is effectively forced on internally, but only the per-feature flags set to `true` actually activate their feature:
 
 | Feature | Variable | Description |
 |---|---|---|
 | API key | `ACCESS_REQUIRE_API_KEY=true` + `API_KEY=...` | Require `X-API-Key` header on protected endpoints |
 | Localhost only | `ACCESS_LOCALHOST_ONLY=true` | Only allow loopback IPs (direct socket, no proxy trust) |
 | IP allowlist | `ACCESS_ENABLE_IP_ALLOWLIST=true` + `ACCESS_IP_ALLOWLIST=...` | Comma-separated IPs/CIDRs |
-| CORS restriction | `ACCESS_ENABLE_CORS_RESTRICTION=true` + `ACCESS_CORS_ALLOWED_ORIGINS=...` | Browser-only protection |
+| CORS restriction | `ACCESS_ENABLE_CORS_RESTRICTION=true` + `ACCESS_CORS_ALLOWED_ORIGINS=...` | Browser-only protection, not primary access control |
 | Rate limiting | `ACCESS_ENABLE_RATE_LIMIT=true` + `ACCESS_RATE_LIMIT_RPM=60` | In-memory per-IP sliding window |
 
 All IP-based checks use `request.client.host` only — no `X-Forwarded-For` or proxy headers are trusted.
+
+CORS is only relevant for browser clients. It does not protect server-to-server callers, CLI tools, reverse proxies, or other non-browser clients, so it must not be treated as a primary access-control mechanism.
 
 ## API reference
 
@@ -99,7 +103,14 @@ Raw binary body + query parameters. Returns the rendered image as binary respons
 | `dt_arg` | | Extra darktable-cli argv tokens (repeated, level 3 only) |
 | `dt_conf` | | Extra `--conf key=value` entries (repeated, level 3 only) |
 
-**Error responses (JSON):** 400, 403, 413, 415, 500, 504
+**Error responses (JSON):** 400, 403, 413, 415, 500, 504 using the unified shape:
+
+```json
+{
+  "error": "Human-readable summary",
+  "details": {"optional": "structured context"}
+}
+```
 
 ### `POST /preview`
 
@@ -115,7 +126,7 @@ Fixed server-side preset endpoint. The RAW file is sent as the raw HTTP body. Al
 
 **Response:** rendered image with `Content-Type` (e.g. `image/jpeg`) and `Content-Disposition: inline; filename="<name>.<ext>"`.
 
-**Error responses (JSON):** 400, 413, 415, 500, 504
+**Error responses (JSON):** 400, 413, 415, 500, 504 using the same unified error shape.
 
 ## Configuration
 
@@ -157,14 +168,18 @@ All settings via environment variables, `.env` file, or Docker Compose. See `.en
 
 ```bash
 docker build -t darktable-cli-server .
-docker run --rm -p 8000:8000 darktable-cli-server
+docker run --rm -e HOST=0.0.0.0 -e PORT=8000 -p 8000:8000 darktable-cli-server
 ```
+
+To change the runtime port, set `PORT` and publish the same container port, for example `-e PORT=9000 -p 9000:9000`.
 
 ### Docker Compose
 
 ```bash
 docker compose up --build
 ```
+
+`docker-compose.yml` now forwards `HOST` and `PORT` into the container and uses `PORT` for the published port mapping.
 
 ### Local Python
 
@@ -173,7 +188,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 # Requires darktable-cli installed on the host
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+HOST=0.0.0.0 PORT=8000 python -m app
 ```
 
 ## Usage examples
@@ -254,7 +269,9 @@ pytest -v
 
 - **SECURITY_LEVEL=1** for pure preview integrations (minimal attack surface)
 - **SECURITY_LEVEL=2** (default) for general use with safe parameter control
-- **SECURITY_LEVEL=3** only when you need `dt_arg`/`dt_conf` passthrough — always combine with access security
+- **SECURITY_LEVEL=3** only for trusted local power-user scenarios that need `dt_arg`/`dt_conf` passthrough
+- At level 3, enable concrete access controls such as API key, localhost-only mode, IP allowlist, or rate limiting as needed
+- Prefer `ACCESS_LOCALHOST_ONLY=true` or an equally strict boundary when running level 3
 - Use a reverse proxy (nginx, Traefik) for TLS termination and additional rate limiting
 - For multi-worker deployments, use an external rate limiter instead of the built-in one
 
